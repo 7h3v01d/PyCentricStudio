@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pycentric-studio"
+version = "1.0.0"
+description = "An all-in-one Python project tool: editor, DB viewer, scaffolding, and cleaner"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyQt5>=5.15",
+    "PyQtWebEngine>=5.15",
+    "markdown2>=2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "flake8", "black"]
+
+[project.scripts]
+pycentric = "pycentric.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
