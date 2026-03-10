@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
 )
 
 import pycentric.core.services.venv_backend as vbe
-from pycentric.core.utils.threading import BackgroundTask
+from pycentric.core.utils.threading import BackgroundTask, TaskSlot
 from pycentric.ui.common import theme
 
 
@@ -61,8 +61,15 @@ class VenvManagerPanel(QWidget):
     def __init__(self, status_fn=None, parent=None) -> None:
         super().__init__(parent)
         self._status = status_fn or (lambda m: None)
-        self._envs: dict = {}           # name → info dict
-        self._active_task: BackgroundTask | None = None
+        self._envs: dict = {}
+        # Per-operation slots — each holds its task alive and enforces at-most-one
+        self._slot_envs    = TaskSlot("envs")
+        self._slot_pkgs    = TaskSlot("packages")
+        self._slot_dep     = TaskSlot("deptree")
+        self._slot_pypi    = TaskSlot("pypi_search")
+        self._slot_info    = TaskSlot("pypi_info")
+        self._slot_outdated= TaskSlot("outdated")
+        self._slot_task    = TaskSlot("generic")    # for create/delete/install/etc.
         self._build_ui()
         self._reload_envs()
 
@@ -328,10 +335,11 @@ class VenvManagerPanel(QWidget):
 
     def _reload_envs(self) -> None:
         self._log_info("Loading environments…")
-        task = BackgroundTask(vbe.load_environments)
-        task.finished.connect(self._on_envs_loaded)
-        task.error.connect(lambda e: self._log_err(f"Load failed: {e}"))
-        task.start()
+        self._slot_envs.run(
+            vbe.load_environments,
+            on_done=self._on_envs_loaded,
+            on_error=lambda e: self._log_err(f"Load failed: {e}"),
+        )
 
     def _on_envs_loaded(self, envs: dict) -> None:
         self._envs = envs
@@ -403,10 +411,11 @@ class VenvManagerPanel(QWidget):
         name = self._pkg_env.currentText()
         if not name: return
         self._log_info(f"Loading packages for {name}…")
-        task = BackgroundTask(vbe.get_installed_packages, name)
-        task.finished.connect(self._on_packages_loaded)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_pkgs.run(
+            vbe.get_installed_packages, name,
+            on_done=self._on_packages_loaded,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_packages_loaded(self, pkgs: dict) -> None:
         self._all_pkgs = pkgs
@@ -439,10 +448,11 @@ class VenvManagerPanel(QWidget):
         pkg  = self._selected_pkg()
         if not name or not pkg: return
         self._log_info(f"Building dependency tree for {pkg}…")
-        task = BackgroundTask(vbe.get_dependency_tree, name, pkg)
-        task.finished.connect(self._on_dep_tree_loaded)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_dep.run(
+            vbe.get_dependency_tree, name, pkg,
+            on_done=self._on_dep_tree_loaded,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_dep_tree_loaded(self, tree: dict) -> None:
         self._dep_tree.clear()
@@ -506,10 +516,11 @@ class VenvManagerPanel(QWidget):
         q = self._pypi_query.text().strip()
         if not q: return
         self._log_info(f"Searching PyPI for '{q}'…")
-        task = BackgroundTask(vbe.search_pypi, q)
-        task.finished.connect(self._on_search_done)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_pypi.run(
+            vbe.search_pypi, q,
+            on_done=self._on_search_done,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_search_done(self, result: tuple) -> None:
         ok, data = result
@@ -530,10 +541,11 @@ class VenvManagerPanel(QWidget):
             self._fetch_pypi_info(item.text())
 
     def _fetch_pypi_info(self, pkg: str) -> None:
-        task = BackgroundTask(vbe.get_pypi_info, pkg)
-        task.finished.connect(self._on_pypi_info)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_info.run(
+            vbe.get_pypi_info, pkg,
+            on_done=self._on_pypi_info,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_pypi_info(self, result: tuple) -> None:
         ok, data = result
@@ -590,10 +602,11 @@ class VenvManagerPanel(QWidget):
         name = self._out_env.currentText()
         if not name: return
         self._log_info(f"Checking outdated packages in {name}…")
-        task = BackgroundTask(vbe.get_outdated, name)
-        task.finished.connect(self._on_outdated_loaded)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_outdated.run(
+            vbe.get_outdated, name,
+            on_done=self._on_outdated_loaded,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_outdated_loaded(self, pkgs: list) -> None:
         self._out_table.setRowCount(0)
@@ -749,10 +762,11 @@ class VenvManagerPanel(QWidget):
     # ── Generic task runner ───────────────────────────────────────────────────
 
     def _run_task(self, fn, *args) -> None:
-        task = BackgroundTask(fn, *args)
-        task.finished.connect(self._on_task_done)
-        task.error.connect(lambda e: self._log_err(e))
-        task.start()
+        self._slot_task.run(
+            fn, *args,
+            on_done=self._on_task_done,
+            on_error=lambda e: self._log_err(e),
+        )
 
     def _on_task_done(self, result) -> None:
         if isinstance(result, tuple):

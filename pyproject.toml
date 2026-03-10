@@ -4,8 +4,8 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "pycentric-studio"
-version = "1.0.0"
-description = "An all-in-one Python project tool: editor, DB viewer, scaffolding, and cleaner"
+version = "1.1.0"
+description = "An all-in-one Python project tool: editor, DB viewer, scaffolding, cleaner, venv manager"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -15,10 +15,60 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "flake8", "black"]
+dev = [
+    "pytest>=7",
+    "pytest-qt",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pre-commit",
+]
 
 [project.scripts]
 pycentric = "pycentric.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+# ── Ruff ─────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py39"
+line-length    = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in default args
+    "SIM108", # ternary operator — too opinionated
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pycentric"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ── Mypy ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version         = "3.9"
+warn_return_any        = true
+warn_unused_configs    = true
+disallow_untyped_defs  = false   # relax for PyQt5 subclasses
+ignore_missing_imports = true    # PyQt5 stubs vary by platform
+exclude                = ["tests/"]
+
+# ── Pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts   = "-v --tb=short"

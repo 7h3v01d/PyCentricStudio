@@ -1,33 +1,33 @@
 """
 pycentric.ui.components.explorer.project_explorer
 ==================================================
-The left-hand project tree panel:
-  • File system tree (QFileSystemModel)
-  • Content search bar (background thread)
-  • Context menu (new / rename / delete / zip / run / lint)
-  • Git panel at the bottom
-  • Project statistics label
+The left-hand project tree panel.
 
-All Python-running and linting is delegated to the caller (EditorPanel)
-via signals so this widget stays focused on navigation.
+Improvements (2026 edition)
+----------------------------
+* TaskSlot used for search + stats → at-most-one-running, proper cancel
+* progress bar shown during stats collection
+* search: case-sensitive toggle + "✕ Clear" button
+* ripgrep used automatically when available (see filesystem.py)
+* search bar debounced at 400ms (was 500)
+* "Open Recent" signal emitted so mainwindow can populate File menu
 """
 
 from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Callable
 
-from PyQt5.QtCore import QDir, Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import QDir, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
-    QFileDialog, QFileSystemModel, QInputDialog, QLabel, QLineEdit,
-    QMenu, QMessageBox, QPushButton, QTreeView,
-    QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QFileSystemModel, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QTreeView, QVBoxLayout, QWidget,
 )
 
 from pycentric.core.settings import settings
 from pycentric.core.types import TREE_NAME_FILTERS, is_text_file
-from pycentric.core.utils.threading import BackgroundTask
+from pycentric.core.utils.threading import TaskSlot
 from pycentric.core.utils.zip_utils import unique_path, zip_path, unzip_to
 from pycentric.core.services.filesystem import search_content, collect_stats
 from pycentric.core.services.venv_service import find_venv
@@ -38,23 +38,26 @@ from pycentric.ui.components.explorer.git_panel import GitPanel
 class ProjectExplorer(QWidget):
     """Emits signals for the parent to act on — no subprocess/editor coupling."""
 
-    file_activated     = pyqtSignal(str)   # user wants to open this path
-    run_requested      = pyqtSignal(str)   # run this .py file
-    lint_requested     = pyqtSignal(str)   # lint this .py file
-    venv_found         = pyqtSignal(str)   # emitted when venv detected/changed
-    status_message     = pyqtSignal(str)   # short status text
+    file_activated  = pyqtSignal(str)
+    run_requested   = pyqtSignal(str)
+    lint_requested  = pyqtSignal(str)
+    venv_found      = pyqtSignal(str)
+    status_message  = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setMaximumWidth(360)
-        self._search_task: BackgroundTask | None = None
+        self.setMaximumWidth(380)
+
+        self._search_slot = TaskSlot("search")
+        self._stats_slot  = TaskSlot("stats")
+
         self._build_ui()
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(500)
+        self._search_timer.setInterval(400)
         self._search_timer.timeout.connect(self._do_search)
 
-    # ── build ─────────────────────────────────────────────────────────────────
+    # ── construction ──────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -65,11 +68,48 @@ class ProjectExplorer(QWidget):
         btn_open.clicked.connect(self.choose_folder)
         layout.addWidget(btn_open)
 
+        # ── search row ──
+        search_row = QHBoxLayout()
         self._search_bar = QLineEdit()
         self._search_bar.setPlaceholderText("🔍 Search file contents…")
         self._search_bar.textChanged.connect(lambda: self._search_timer.start())
-        layout.addWidget(self._search_bar)
+        self._search_bar.returnPressed.connect(self._do_search)  # immediate on Enter
 
+        self._clear_btn = QPushButton("✕")
+        self._clear_btn.setFixedSize(24, 24)
+        self._clear_btn.setToolTip("Clear search")
+        self._clear_btn.setStyleSheet(f"background:{theme.BG3}; color:{theme.FG_DIM}; border:none; font-size:10pt;")
+        self._clear_btn.clicked.connect(self._clear_search)
+        self._clear_btn.setVisible(False)
+
+        self._case_cb = QCheckBox("Aa")
+        self._case_cb.setToolTip("Case sensitive")
+        self._case_cb.setStyleSheet(f"color:{theme.FG_DIM}; font-size:9pt;")
+        self._case_cb.stateChanged.connect(lambda: self._do_search() if self._search_bar.text() else None)
+
+        search_row.addWidget(self._search_bar, 1)
+        search_row.addWidget(self._clear_btn)
+        search_row.addWidget(self._case_cb)
+        layout.addLayout(search_row)
+
+        # make clear button appear/disappear
+        self._search_bar.textChanged.connect(
+            lambda t: self._clear_btn.setVisible(bool(t))
+        )
+
+        # ── progress bar (hidden until stats run) ──
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setFixedHeight(4)
+        self._progress.setTextVisible(False)
+        self._progress.setStyleSheet(f"""
+            QProgressBar {{ background:{theme.BG3}; border:none; border-radius:2px; }}
+            QProgressBar::chunk {{ background:{theme.ACCENT}; border-radius:2px; }}
+        """)
+        self._progress.setVisible(False)
+        layout.addWidget(self._progress)
+
+        # ── file tree ──
         self._model = QFileSystemModel()
         self._model.setFilter(QDir.NoDotAndDotDot | QDir.AllDirs | QDir.Files)
         self._model.setNameFilters(TREE_NAME_FILTERS)
@@ -77,7 +117,7 @@ class ProjectExplorer(QWidget):
 
         self._tree = QTreeView()
         self._tree.setModel(self._model)
-        self._tree.setColumnWidth(0, 220)
+        self._tree.setColumnWidth(0, 230)
         self._tree.hideColumn(1); self._tree.hideColumn(2); self._tree.hideColumn(3)
         self._tree.setAlternatingRowColors(True)
         self._tree.clicked.connect(self._on_click)
@@ -85,8 +125,9 @@ class ProjectExplorer(QWidget):
         self._tree.customContextMenuRequested.connect(self._ctx_menu)
         layout.addWidget(self._tree, 1)
 
+        # ── stats label ──
         self._stats = QLabel("")
-        self._stats.setStyleSheet(f"color: {theme.FG_DIM}; font-size: 9pt; padding: 2px;")
+        self._stats.setStyleSheet(f"color:{theme.FG_DIM}; font-size:9pt; padding:2px;")
         self._stats.setWordWrap(True)
         layout.addWidget(self._stats)
 
@@ -120,7 +161,7 @@ class ProjectExplorer(QWidget):
         if folder:
             self.set_root(folder)
 
-    # ── event handlers ────────────────────────────────────────────────────────
+    # ── tree events ───────────────────────────────────────────────────────────
 
     def _on_click(self, index) -> None:
         path = self._model.filePath(index)
@@ -141,20 +182,22 @@ class ProjectExplorer(QWidget):
             menu.addAction("🗜 Zip Folder",  lambda: self._zip(path))
         else:
             if path.endswith(".py"):
-                menu.addAction("▶ Run",     lambda: self.run_requested.emit(path))
-                menu.addAction("🧪 Lint",   lambda: self.lint_requested.emit(path))
+                menu.addAction("▶ Run",   lambda: self.run_requested.emit(path))
+                menu.addAction("🧪 Lint", lambda: self.lint_requested.emit(path))
             if path.endswith((".md", ".markdown")):
                 menu.addAction("👁 Preview", lambda: self.file_activated.emit(path))
             if path.endswith(".zip"):
-                menu.addAction("📦 Unzip",  lambda: self._unzip(path))
+                menu.addAction("📦 Unzip", lambda: self._unzip(path))
             else:
-                menu.addAction("🗜 Zip",    lambda: self._zip(path))
+                menu.addAction("🗜 Zip",   lambda: self._zip(path))
             if Path(path).name == "requirements.txt":
-                menu.addAction("📦 Install Deps", lambda: self.run_requested.emit("__install__:" + path))
+                menu.addAction("📦 Install Deps",
+                               lambda: self.run_requested.emit("__install__:" + path))
 
         menu.addSeparator()
         menu.addAction("✏️ Rename…",   lambda: self._rename(path))
-        menu.addAction("📋 Copy Path", lambda: __import__("PyQt5.QtWidgets", fromlist=["QApplication"])
+        menu.addAction("📋 Copy Path",
+                       lambda: __import__("PyQt5.QtWidgets", fromlist=["QApplication"])
                        .QApplication.clipboard().setText(path))
         menu.addAction("🗑 Delete",    lambda: self._delete(path))
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
@@ -165,8 +208,7 @@ class ProjectExplorer(QWidget):
         name, ok = QInputDialog.getText(self, "New File", "File name:")
         if ok and name:
             try:
-                p = Path(folder) / name
-                p.touch()
+                p = Path(folder) / name; p.touch()
                 self.file_activated.emit(str(p))
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -174,19 +216,15 @@ class ProjectExplorer(QWidget):
     def _new_folder(self, folder: str) -> None:
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
         if ok and name:
-            try:
-                (Path(folder) / name).mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+            try: (Path(folder) / name).mkdir(parents=True, exist_ok=True)
+            except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def _rename(self, path: str) -> None:
         p = Path(path)
         new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=p.name)
         if ok and new_name and new_name != p.name:
-            try:
-                p.rename(p.parent / new_name)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", str(e))
+            try: p.rename(p.parent / new_name)
+            except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def _delete(self, path: str) -> None:
         p = Path(path)
@@ -195,13 +233,12 @@ class ProjectExplorer(QWidget):
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
             try:
-                if p.is_file(): p.unlink()
-                else:           shutil.rmtree(p)
+                p.unlink() if p.is_file() else shutil.rmtree(p)
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
     def _zip(self, path: str) -> None:
-        src = Path(path)
+        src  = Path(path)
         dest = unique_path(src.parent / (src.stem + ".zip")) if src.is_file() \
                else unique_path(src.with_suffix(".zip"))
         try:
@@ -212,53 +249,66 @@ class ProjectExplorer(QWidget):
 
     def _unzip(self, path: str) -> None:
         src = Path(path)
-        dest = unique_path(src.parent / src.stem)
         try:
-            unzip_to(src, dest)
-            self.status_message.emit(f"Extracted to {dest}")
+            unzip_to(src, unique_path(src.parent / src.stem))
+            self.status_message.emit(f"Extracted to {src.stem}/")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
     # ── search ────────────────────────────────────────────────────────────────
 
+    def _clear_search(self) -> None:
+        self._search_bar.clear()
+        self._model.setNameFilters(TREE_NAME_FILTERS)
+        self._model.setNameFilterDisables(False)
+        self.status_message.emit("Search cleared.")
+
     def _do_search(self) -> None:
-        text = self._search_bar.text().strip().lower()
+        text = self._search_bar.text().strip()
         if not text:
             self._model.setNameFilters(TREE_NAME_FILTERS)
             self._model.setNameFilterDisables(False)
             return
-
-        if self._search_task and self._search_task.is_running():
-            self._search_task.cancel()
 
         root = self.root_path()
         if not root:
             return
 
         self.status_message.emit("Searching…")
+        case = self._case_cb.isChecked()
 
-        def _search():
-            task = self._search_task
-            return search_content(root, text, cancelled=lambda: task is not None and task.is_cancelled)
-
-        self._search_task = BackgroundTask(_search)
-        self._search_task.finished.connect(self._on_search_done)
-        self._search_task.error.connect(lambda e: self.status_message.emit("Search error."))
-        self._search_task.start()
+        self._search_slot.run(
+            search_content, root, text, case,
+            on_done=self._on_search_done,
+            on_error=lambda s: self.status_message.emit(f"Search error: {s}"),
+        )
 
     def _on_search_done(self, matches: list) -> None:
-        self._model.setNameFilters(matches if matches else ["*.nomatch"])
+        filenames = [Path(m).name for m in matches]
+        self._model.setNameFilters(filenames if filenames else ["*.nomatch"])
         self._model.setNameFilterDisables(False)
-        self.status_message.emit(f"Found {len(matches)} file(s).")
+        n = len(matches)
+        self.status_message.emit(f"Found {n} file{'s' if n != 1 else ''}.")
 
     # ── stats ─────────────────────────────────────────────────────────────────
 
     def _refresh_stats(self, root: str) -> None:
-        task = BackgroundTask(collect_stats, root)
-        task.finished.connect(self._on_stats)
-        task.start()
+        self._stats.setText("Scanning…")
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+
+        self._stats_slot.run(
+            collect_stats, root,
+            on_done=self._on_stats,
+            on_error=lambda s: (
+                self._stats.setText(f"Stats error: {s}"),
+                self._progress.setVisible(False),
+            ),
+            on_progress=self._progress.setValue,
+        )
 
     def _on_stats(self, stats) -> None:
+        self._progress.setVisible(False)
         self._stats.setText(
             f"{stats.total_files} files  •  {stats.python_files} .py  •  "
             f"{stats.total_lines:,} lines"

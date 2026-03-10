@@ -120,7 +120,7 @@ class CleanerPanel(QWidget):
         def _do_clean():
             return clean(folder, patterns)
 
-        task = BackgroundTask(_do_clean)
+        task = self._task = BackgroundTask(_do_clean)
         task.finished.connect(self._on_clean_done)
         task.error.connect(lambda e: self._out.appendPlainText(f"Error: {e}"))
         task.start()
